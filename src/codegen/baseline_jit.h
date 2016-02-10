@@ -132,7 +132,7 @@ class JitFragmentWriter;
 class JitCodeBlock {
 public:
     static constexpr int scratch_size = 256;
-    static constexpr int code_size = 32768;
+    static constexpr int memory_size = 32768; // must fit the EH frame + generated code
     static constexpr int num_stack_args = 2;
 
     // scratch size + space for passing additional args on the stack without having to adjust the SP when calling
@@ -140,8 +140,8 @@ public:
     static constexpr int sp_adjustment = scratch_size + num_stack_args * 8 + 8 /* = alignment */;
 
 private:
-    std::unique_ptr<uint8_t[]> code;
-    std::unique_ptr<uint8_t[]> eh_frame;
+    // the memory block contains the EH frame directly followed by the generated machine code.
+    std::unique_ptr<uint8_t[]> memory;
     int entry_offset;
     assembler::Assembler a;
     bool is_currently_writing;
@@ -246,6 +246,7 @@ public:
     void emitExec(RewriterVar* code, RewriterVar* globals, RewriterVar* locals, FutureFlags flags);
     void emitJump(CFGBlock* b);
     void emitOSRPoint(AST_Jump* node);
+    void emitPendingCallsCheck();
     void emitPrint(RewriterVar* dest, RewriterVar* var, bool nl);
     void emitRaise0();
     void emitRaise3(RewriterVar* arg0, RewriterVar* arg1, RewriterVar* arg2);

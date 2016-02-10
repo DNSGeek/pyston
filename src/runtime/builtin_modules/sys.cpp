@@ -26,7 +26,6 @@
 #include "capi/types.h"
 #include "codegen/unwinding.h"
 #include "core/types.h"
-#include "runtime/file.h"
 #include "runtime/inline/boxing.h"
 #include "runtime/inline/list.h"
 #include "runtime/int.h"
@@ -99,12 +98,6 @@ BoxedList* getSysPath() {
     return static_cast<BoxedList*>(_sys_path);
 }
 
-Box* getSysStdout() {
-    Box* sys_stdout = sys_module->getattr(internStringMortal("stdout"));
-    RELEASE_ASSERT(sys_stdout, "lost sys.stdout??");
-    return sys_stdout;
-}
-
 Box* sysGetFrame(Box* val) {
     int depth = 0;
     if (val) {
@@ -119,6 +112,13 @@ Box* sysGetFrame(Box* val) {
         raiseExcHelper(ValueError, "call stack is not deep enough");
     }
     return frame;
+}
+
+Box* sysCurrentFrames() {
+    Box* rtn = _PyThread_CurrentFrames();
+    if (!rtn)
+        throwCAPIException();
+    return rtn;
 }
 
 Box* sysGetDefaultEncoding() {
@@ -646,13 +646,6 @@ void setupSys() {
 
     sys_module->giveAttr("argv", new BoxedList());
 
-    sys_module->giveAttr("stdout", new BoxedFile(stdout, "<stdout>", "w"));
-    sys_module->giveAttr("stdin", new BoxedFile(stdin, "<stdin>", "r"));
-    sys_module->giveAttr("stderr", new BoxedFile(stderr, "<stderr>", "w"));
-    sys_module->giveAttr("__stdout__", sys_module->getattr(internStringMortal("stdout")));
-    sys_module->giveAttr("__stdin__", sys_module->getattr(internStringMortal("stdin")));
-    sys_module->giveAttr("__stderr__", sys_module->getattr(internStringMortal("stderr")));
-
     sys_module->giveAttr("exc_info",
                          new BoxedBuiltinFunctionOrMethod(FunctionMetadata::create((void*)sysExcInfo, BOXED_TUPLE, 0),
                                                           "exc_info", exc_info_doc));
@@ -674,6 +667,8 @@ void setupSys() {
     sys_module->giveAttr(
         "_getframe",
         new BoxedFunction(FunctionMetadata::create((void*)sysGetFrame, UNKNOWN, 1, false, false), { NULL }));
+    sys_module->giveAttr("_current_frames",
+                         new BoxedFunction(FunctionMetadata::create((void*)sysCurrentFrames, UNKNOWN, 0)));
     sys_module->giveAttr("getdefaultencoding", new BoxedBuiltinFunctionOrMethod(
                                                    FunctionMetadata::create((void*)sysGetDefaultEncoding, STR, 0),
                                                    "getdefaultencoding", getdefaultencoding_doc));

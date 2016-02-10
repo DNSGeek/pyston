@@ -174,6 +174,11 @@ template <typename Builder> static llvm::Value* getGlobalsGep(Builder& builder, 
     return builder.CreateConstInBoundsGEP2_32(v, 0, 6);
 }
 
+template <typename Builder> static llvm::Value* getMDGep(Builder& builder, llvm::Value* v) {
+    static_assert(offsetof(FrameInfo, md) == 64 + 16, "");
+    return builder.CreateConstInBoundsGEP2_32(v, 0, 8);
+}
+
 void IRGenState::setupFrameInfoVar(llvm::Value* passed_closure, llvm::Value* passed_globals,
                                    llvm::Value* frame_info_arg) {
     /*
@@ -273,9 +278,12 @@ void IRGenState::setupFrameInfoVar(llvm::Value* passed_closure, llvm::Value* pas
         builder.CreateStore(passed_globals, getGlobalsGep(builder, al));
         // set frame_info.vregs
         builder.CreateStore(vregs, getVRegsGep(builder, al));
+        builder.CreateStore(embedRelocatablePtr(getMD(), g.llvm_functionmetadata_type_ptr), getMDGep(builder, al));
 
         this->frame_info = al;
         this->globals = passed_globals;
+
+        builder.CreateCall(g.funcs.initFrame, this->frame_info);
     }
 
     stmt = getStmtGep(builder, frame_info);
@@ -339,8 +347,54 @@ private:
     llvm::BasicBlock*& curblock;
     IRGenerator* irgenerator;
 
+    void emitPendingCallsCheck(llvm::BasicBlock* exc_dest) {
+        auto&& builder = *getBuilder();
+
+        llvm::GlobalVariable* pendingcalls_to_do_gv = g.cur_module->getGlobalVariable("_pendingcalls_to_do");
+        if (!pendingcalls_to_do_gv) {
+            static_assert(sizeof(_pendingcalls_to_do) == 4, "");
+            pendingcalls_to_do_gv = new llvm::GlobalVariable(
+                *g.cur_module, g.i32, false, llvm::GlobalValue::ExternalLinkage, 0, "_pendingcalls_to_do");
+            pendingcalls_to_do_gv->setAlignment(4);
+        }
+
+        llvm::BasicBlock* cur_block = builder.GetInsertBlock();
+
+        llvm::BasicBlock* pendingcalls_set = createBasicBlock("_pendingcalls_set");
+        pendingcalls_set->moveAfter(cur_block);
+        llvm::BasicBlock* join_block = createBasicBlock("continue_after_pendingcalls_check");
+        join_block->moveAfter(pendingcalls_set);
+
+        llvm::Value* pendingcalls_to_do_val = builder.CreateLoad(pendingcalls_to_do_gv, true /* volatile */);
+        llvm::Value* is_zero
+            = builder.CreateICmpEQ(pendingcalls_to_do_val, getConstantInt(0, pendingcalls_to_do_val->getType()));
+
+        llvm::Metadata* md_vals[]
+            = { llvm::MDString::get(g.context, "branch_weights"), llvm::ConstantAsMetadata::get(getConstantInt(1000)),
+                llvm::ConstantAsMetadata::get(getConstantInt(1)) };
+        llvm::MDNode* branch_weights = llvm::MDNode::get(g.context, llvm::ArrayRef<llvm::Metadata*>(md_vals));
+
+
+        builder.CreateCondBr(is_zero, join_block, pendingcalls_set, branch_weights);
+        {
+            setCurrentBasicBlock(pendingcalls_set);
+
+            if (exc_dest) {
+                builder.CreateInvoke(g.funcs.makePendingCalls, join_block, exc_dest);
+            } else {
+                builder.CreateCall(g.funcs.makePendingCalls);
+                builder.CreateBr(join_block);
+            }
+        }
+
+        cur_block = join_block;
+        setCurrentBasicBlock(join_block);
+    }
+
     llvm::CallSite emitCall(const UnwindInfo& unw_info, llvm::Value* callee, const std::vector<llvm::Value*>& args,
                             ExceptionStyle target_exception_style) {
+        emitSetCurrentStmt(unw_info.current_stmt);
+
         if (target_exception_style == CXX && (unw_info.hasHandler() || irstate->getExceptionStyle() == CAPI)) {
             // Create the invoke:
             llvm::BasicBlock* normal_dest
@@ -363,9 +417,13 @@ private:
             // Normal case:
             getBuilder()->SetInsertPoint(normal_dest);
             curblock = normal_dest;
+            emitPendingCallsCheck(exc_dest);
             return rtn;
         } else {
+
             llvm::CallInst* cs = getBuilder()->CreateCall(callee, args);
+            if (target_exception_style == CXX)
+                emitPendingCallsCheck(NULL);
             return cs;
         }
     }
@@ -414,7 +472,7 @@ private:
 
         pp_args.insert(pp_args.end(), ic_stackmap_args.begin(), ic_stackmap_args.end());
 
-        irgenerator->addFrameStackmapArgs(info, unw_info.current_stmt, pp_args);
+        irgenerator->addFrameStackmapArgs(info, pp_args);
 
         llvm::Intrinsic::ID intrinsic_id;
         if (return_type->isIntegerTy() || return_type->isPointerTy()) {
@@ -428,7 +486,6 @@ private:
             abort();
         }
         llvm::Function* patchpoint = this->getIntrinsic(intrinsic_id);
-
         llvm::CallSite rtn = this->emitCall(unw_info, patchpoint, pp_args, target_exception_style);
         return rtn;
     }
@@ -468,6 +525,15 @@ public:
         return llvm::BasicBlock::Create(g.context, name, irstate->getLLVMFunction());
     }
 
+    // Our current frame introspection approach requires that we update the currently executed stmt before doing a call
+    // to a function which could throw an exception, inspect the python call frame,...
+    // Only patchpoint don't need to set the current statement because the stmt will be inluded in the stackmap args.
+    void emitSetCurrentStmt(AST_stmt* stmt) {
+        getBuilder()->CreateStore(stmt ? embedRelocatablePtr(stmt, g.llvm_aststmt_type_ptr)
+                                       : getNullPtr(g.llvm_aststmt_type_ptr),
+                                  irstate->getStmtVar());
+    }
+
     llvm::Value* createCall(const UnwindInfo& unw_info, llvm::Value* callee, const std::vector<llvm::Value*>& args,
                             ExceptionStyle target_exception_style = CXX) override {
 #ifndef NDEBUG
@@ -487,10 +553,6 @@ public:
             }
         }
 #endif
-
-        llvm::Value* stmt = unw_info.current_stmt ? embedRelocatablePtr(unw_info.current_stmt, g.llvm_aststmt_type_ptr)
-                                                  : getNullPtr(g.llvm_aststmt_type_ptr);
-        getBuilder()->CreateStore(stmt, irstate->getStmtVar());
         return emitCall(unw_info, callee, args, target_exception_style).getInstruction();
     }
 
@@ -2077,9 +2139,7 @@ private:
             dest = d->makeConverted(emitter, d->getBoxType());
             d->decvref(emitter);
         } else {
-            llvm::Value* sys_stdout_val = emitter.createCall(unw_info, g.funcs.getSysStdout);
-            dest = new ConcreteCompilerVariable(UNKNOWN, sys_stdout_val, true);
-            // TODO: speculate that sys.stdout is a file?
+            dest = new ConcreteCompilerVariable(UNKNOWN, getNullPtr(g.llvm_value_type_ptr), true);
         }
         assert(dest);
 
@@ -2126,6 +2186,11 @@ private:
         ConcreteCompilerVariable* rtn = val->makeConverted(emitter, opt_rtn_type);
         rtn->ensureGrabbed(emitter);
         val->decvref(emitter);
+
+
+        // Don't call deinitFrame when this is a OSR function because the interpreter will call it
+        if (!irstate->getCurFunction()->entry_descriptor)
+            emitter.getBuilder()->CreateCall(g.funcs.deinitFrame, irstate->getFrameInfoVar());
 
         for (auto& p : symbol_table) {
             p.second->decvref(emitter);
@@ -2587,23 +2652,8 @@ private:
     }
 
 public:
-    void addFrameStackmapArgs(PatchpointInfo* pp, AST_stmt* current_stmt,
-                              std::vector<llvm::Value*>& stackmap_args) override {
+    void addFrameStackmapArgs(PatchpointInfo* pp, std::vector<llvm::Value*>& stackmap_args) override {
         int initial_args = stackmap_args.size();
-
-        assert(UNBOXED_INT->llvmType() == g.i64);
-        if (ENABLE_JIT_OBJECT_CACHE) {
-            llvm::Value* v;
-            if (current_stmt)
-                v = emitter.getBuilder()->CreatePtrToInt(embedRelocatablePtr(current_stmt, g.i8_ptr), g.i64);
-            else
-                v = getConstantInt(0, g.i64);
-            stackmap_args.push_back(v);
-        } else {
-            stackmap_args.push_back(getConstantInt((uint64_t)current_stmt, g.i64));
-        }
-
-        pp->addFrameVar("!current_stmt", UNBOXED_INT);
 
         // For deopts we need to add the compiler created names to the stackmap
         if (ENABLE_FRAME_INTROSPECTION && pp->isDeopt()) {
@@ -2881,9 +2931,10 @@ public:
     }
 
     void doSafePoint(AST_stmt* next_statement) override {
-        // Unwind info is always needed in allowGLReadPreemption if it has any chance of
-        // running arbitrary code like finalizers.
-        emitter.createCall(UnwindInfo(next_statement, NULL), g.funcs.allowGLReadPreemption);
+        // We need to setup frame introspection by updating the current stmt because we can run can run arbitrary code
+        // like finalizers inside allowGLReadPreemption.
+        emitter.emitSetCurrentStmt(next_statement);
+        emitter.getBuilder()->CreateCall(g.funcs.allowGLReadPreemption);
     }
 
     // Create a (or reuse an existing) block that will catch a CAPI exception, and then forward
@@ -2904,8 +2955,10 @@ public:
             emitter.setCurrentBasicBlock(capi_exc_dest);
             assert(!phi_node);
             phi_node = emitter.getBuilder()->CreatePHI(g.llvm_aststmt_type_ptr, 0);
-            emitter.getBuilder()->CreateCall2(g.funcs.caughtCapiException, phi_node,
-                                              embedRelocatablePtr(irstate->getSourceInfo(), g.i8_ptr));
+
+            emitter.emitSetCurrentStmt(current_stmt);
+            emitter.getBuilder()->CreateCall(g.funcs.caughtCapiException,
+                                             { phi_node, embedRelocatablePtr(irstate->getSourceInfo(), g.i8_ptr) });
 
             if (!final_dest) {
                 // Propagate the exception out of the function:
@@ -2913,6 +2966,7 @@ public:
                     emitter.getBuilder()->CreateCall(g.funcs.reraiseCapiExcAsCxx);
                     emitter.getBuilder()->CreateUnreachable();
                 } else {
+                    emitter.getBuilder()->CreateCall(g.funcs.deinitFrame, irstate->getFrameInfoVar());
                     emitter.getBuilder()->CreateRet(getNullPtr(g.llvm_value_type_ptr));
                 }
             } else {

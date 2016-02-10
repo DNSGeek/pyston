@@ -37,7 +37,6 @@
 #include "runtime/code.h"
 #include "runtime/complex.h"
 #include "runtime/dict.h"
-#include "runtime/file.h"
 #include "runtime/hiddenclass.h"
 #include "runtime/ics.h"
 #include "runtime/iterobject.h"
@@ -105,6 +104,9 @@ void FrameInfo::gcVisit(GCVisitor* visitor) {
     visitor->visit(&exc.type);
     visitor->visit(&exc.value);
     visitor->visit(&frame_obj);
+
+    if (back)
+        ((FrameInfo*)back)->gcVisit(visitor);
 }
 
 // Analogue of PyType_GenericAlloc (default tp_alloc), but should only be used for Pyston classes!
@@ -1565,9 +1567,9 @@ void BoxedClosure::gcHandler(GCVisitor* v, Box* b) {
 extern "C" {
 BoxedClass* object_cls, *type_cls, *none_cls, *bool_cls, *int_cls, *float_cls,
     * str_cls = NULL, *function_cls, *instancemethod_cls, *list_cls, *slice_cls, *module_cls, *dict_cls, *tuple_cls,
-      *file_cls, *member_descriptor_cls, *closure_cls, *generator_cls, *null_importer_cls, *complex_cls,
-      *basestring_cls, *property_cls, *staticmethod_cls, *classmethod_cls, *attrwrapper_cls, *pyston_getset_cls,
-      *capi_getset_cls, *builtin_function_or_method_cls, *attrwrapperiter_cls, *set_cls, *frozenset_cls;
+      *member_descriptor_cls, *closure_cls, *generator_cls, *null_importer_cls, *complex_cls, *basestring_cls,
+      *property_cls, *staticmethod_cls, *classmethod_cls, *attrwrapper_cls, *pyston_getset_cls, *capi_getset_cls,
+      *builtin_function_or_method_cls, *attrwrapperiter_cls, *set_cls, *frozenset_cls;
 
 BoxedTuple* EmptyTuple;
 }
@@ -3626,6 +3628,11 @@ static Box* getsetDelete(Box* self, Box* obj) {
     return getsetSet(self, obj, NULL);
 }
 
+static int _check_and_flush(FILE* stream) {
+    int prev_fail = ferror(stream);
+    return fflush(stream) || prev_fail ? EOF : 0;
+}
+
 bool TRACK_ALLOCATIONS = false;
 void setupRuntime() {
 
@@ -3701,21 +3708,19 @@ void setupRuntime() {
         BoxedClass(object_cls, &AttrWrapper::gcHandler, 0, 0, sizeof(AttrWrapper), false, "attrwrapper");
     dict_cls = new (0) BoxedClass(object_cls, &BoxedDict::gcHandler, 0, 0, sizeof(BoxedDict), false, "dict");
     dict_cls->tp_flags |= Py_TPFLAGS_DICT_SUBCLASS;
-    file_cls = new (0) BoxedClass(object_cls, &BoxedFile::gcHandler, 0, offsetof(BoxedFile, weakreflist),
-                                  sizeof(BoxedFile), false, "file");
     int_cls = new (0) BoxedClass(object_cls, NULL, 0, 0, sizeof(BoxedInt), false, "int");
     int_cls->tp_flags |= Py_TPFLAGS_INT_SUBCLASS;
-    bool_cls = new (0) BoxedClass(int_cls, NULL, 0, 0, sizeof(BoxedBool), false, "bool");
+    bool_cls = new (0) BoxedClass(int_cls, NULL, 0, 0, sizeof(BoxedBool), false, "bool", false);
     complex_cls = new (0) BoxedClass(object_cls, NULL, 0, 0, sizeof(BoxedComplex), false, "complex");
     long_cls = new (0) BoxedClass(object_cls, &BoxedLong::gchandler, 0, 0, sizeof(BoxedLong), false, "long");
     long_cls->tp_flags |= Py_TPFLAGS_LONG_SUBCLASS;
     float_cls = new (0) BoxedClass(object_cls, NULL, 0, 0, sizeof(BoxedFloat), false, "float");
     function_cls = new (0)
         BoxedClass(object_cls, &BoxedFunction::gcHandler, offsetof(BoxedFunction, attrs),
-                   offsetof(BoxedFunction, in_weakreflist), sizeof(BoxedFunction), false, "function");
+                   offsetof(BoxedFunction, in_weakreflist), sizeof(BoxedFunction), false, "function", false);
     builtin_function_or_method_cls = new (0)
         BoxedClass(object_cls, &BoxedFunction::gcHandler, 0, offsetof(BoxedBuiltinFunctionOrMethod, in_weakreflist),
-                   sizeof(BoxedBuiltinFunctionOrMethod), false, "builtin_function_or_method");
+                   sizeof(BoxedBuiltinFunctionOrMethod), false, "builtin_function_or_method", false);
     function_cls->tp_dealloc = builtin_function_or_method_cls->tp_dealloc = functionDtor;
     function_cls->has_safe_tp_dealloc = builtin_function_or_method_cls->has_safe_tp_dealloc = true;
 
@@ -3732,7 +3737,6 @@ void setupRuntime() {
                                            false, "method-wrapper");
     wrapperdescr_cls = new (0) BoxedClass(object_cls, BoxedWrapperDescriptor::gcHandler, 0, 0,
                                           sizeof(BoxedWrapperDescriptor), false, "wrapper_descriptor");
-
     EmptyString = new (0) BoxedString("");
     // Call InternInPlace rather than InternFromString since that will
     // probably try to return EmptyString
@@ -3753,7 +3757,6 @@ void setupRuntime() {
     pyston_getset_cls->tp_mro = BoxedTuple::create({ pyston_getset_cls, object_cls });
     attrwrapper_cls->tp_mro = BoxedTuple::create({ attrwrapper_cls, object_cls });
     dict_cls->tp_mro = BoxedTuple::create({ dict_cls, object_cls });
-    file_cls->tp_mro = BoxedTuple::create({ file_cls, object_cls });
     int_cls->tp_mro = BoxedTuple::create({ int_cls, object_cls });
     bool_cls->tp_mro = BoxedTuple::create({ bool_cls, object_cls });
     complex_cls->tp_mro = BoxedTuple::create({ complex_cls, object_cls });
@@ -3808,7 +3811,6 @@ void setupRuntime() {
     pyston_getset_cls->finishInitialization();
     attrwrapper_cls->finishInitialization();
     dict_cls->finishInitialization();
-    file_cls->finishInitialization();
     int_cls->finishInitialization();
     bool_cls->finishInitialization();
     complex_cls->finishInitialization();
@@ -3833,10 +3835,10 @@ void setupRuntime() {
 
     instancemethod_cls = BoxedClass::create(type_cls, object_cls, &BoxedInstanceMethod::gcHandler, 0,
                                             offsetof(BoxedInstanceMethod, in_weakreflist), sizeof(BoxedInstanceMethod),
-                                            false, "instancemethod");
+                                            false, "instancemethod", false);
 
-    slice_cls
-        = BoxedClass::create(type_cls, object_cls, &BoxedSlice::gcHandler, 0, 0, sizeof(BoxedSlice), false, "slice");
+    slice_cls = BoxedClass::create(type_cls, object_cls, &BoxedSlice::gcHandler, 0, 0, sizeof(BoxedSlice), false,
+                                   "slice", false);
     set_cls = BoxedClass::create(type_cls, object_cls, &BoxedSet::gcHandler, 0, offsetof(BoxedSet, weakreflist),
                                  sizeof(BoxedSet), false, "set");
     frozenset_cls = BoxedClass::create(type_cls, object_cls, &BoxedSet::gcHandler, 0, offsetof(BoxedSet, weakreflist),
@@ -3952,7 +3954,6 @@ void setupRuntime() {
     setupDict();
     setupSet();
     setupTuple();
-    setupFile();
     setupGenerator();
     setupIter();
     setupClassobj();
@@ -4037,7 +4038,6 @@ void setupRuntime() {
     slice_cls->giveAttr("step", new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT, offsetof(BoxedSlice, step)));
     slice_cls->freeze();
     slice_cls->tp_compare = (cmpfunc)slice_compare;
-    slice_cls->tp_flags &= ~Py_TPFLAGS_BASETYPE;
 
     static PyMappingMethods attrwrapper_as_mapping;
     attrwrapper_cls->tp_as_mapping = &attrwrapper_as_mapping;
@@ -4100,6 +4100,21 @@ void setupRuntime() {
     attrwrapperiter_cls->tp_iter = PyObject_SelfIter;
     attrwrapperiter_cls->tp_iternext = AttrWrapperIter::next_capi;
 
+    PyType_Ready(&PyFile_Type);
+    PyObject* sysin, *sysout, *syserr;
+    sysin = PyFile_FromFile(stdin, "<stdin>", "r", NULL);
+    sysout = PyFile_FromFile(stdout, "<stdout>", "w", _check_and_flush);
+    syserr = PyFile_FromFile(stderr, "<stderr>", "w", _check_and_flush);
+    RELEASE_ASSERT(!PyErr_Occurred(), "");
+
+    sys_module->giveAttr("stdout", sysout);
+    sys_module->giveAttr("stdin", sysin);
+    sys_module->giveAttr("stderr", syserr);
+    sys_module->giveAttr("__stdout__", sys_module->getattr(internStringMortal("stdout")));
+    sys_module->giveAttr("__stdin__", sys_module->getattr(internStringMortal("stdin")));
+    sys_module->giveAttr("__stderr__", sys_module->getattr(internStringMortal("stderr")));
+
+
     setupBuiltins();
     _PyExc_Init();
     setupThread();
@@ -4115,6 +4130,7 @@ void setupRuntime() {
 
     PyType_Ready(&PyCObject_Type);
     PyType_Ready(&PyDictProxy_Type);
+
 
     initerrno();
     init_sha();
@@ -4212,7 +4228,6 @@ void teardownRuntime() {
     teardownDict();
     teardownSet();
     teardownTuple();
-    teardownFile();
     teardownDescr();
 
     /*
@@ -4232,7 +4247,6 @@ void teardownRuntime() {
     clearAttrs(module_cls);
     clearAttrs(dict_cls);
     clearAttrs(tuple_cls);
-    clearAttrs(file_cls);
 
     decref(bool_cls);
     decref(int_cls);
@@ -4245,7 +4259,6 @@ void teardownRuntime() {
     decref(module_cls);
     decref(dict_cls);
     decref(tuple_cls);
-    decref(file_cls);
 
     ASSERT(None->nrefs == 1, "%ld", None->nrefs);
     decref(None);

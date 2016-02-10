@@ -479,9 +479,21 @@ extern "C" PyObject* PyObject_SelfIter(PyObject* obj) noexcept {
 }
 
 extern "C" int PyObject_GenericSetAttr(PyObject* obj, PyObject* name, PyObject* value) noexcept {
-    RELEASE_ASSERT(PyString_Check(name), "");
+    if (!PyString_Check(name)) {
+        if (PyUnicode_Check(name)) {
+            name = PyUnicode_AsEncodedString(name, NULL, NULL);
+            if (name == NULL)
+                return -1;
+        } else {
+            PyErr_Format(PyExc_TypeError, "attribute name must be string, not '%.200s'", Py_TYPE(name)->tp_name);
+            return -1;
+        }
+    }
+
     BoxedString* str = static_cast<BoxedString*>(name);
     internStringMortalInplace(str);
+
+    assert(PyString_Check(name));
     try {
         if (value == NULL)
             delattrGeneric(obj, str, NULL);
@@ -566,8 +578,31 @@ extern "C" int PyObject_HasAttrString(PyObject* v, const char* name) noexcept {
 
 // I'm not sure how we can support this one:
 extern "C" PyObject** _PyObject_GetDictPtr(PyObject* obj) noexcept {
-    fatalOrError(PyExc_NotImplementedError, "unimplemented");
-    return nullptr;
+    Py_ssize_t dictoffset;
+    PyTypeObject* tp = Py_TYPE(obj);
+
+    if (!tp->instancesHaveHCAttrs()) {
+        dictoffset = tp->tp_dictoffset;
+        if (dictoffset == 0)
+            return NULL;
+        if (dictoffset < 0) {
+            Py_ssize_t tsize;
+            size_t size;
+
+            tsize = ((PyVarObject*)obj)->ob_size;
+            if (tsize < 0)
+                tsize = -tsize;
+            size = _PyObject_VAR_SIZE(tp, tsize);
+
+            dictoffset += (long)size;
+            assert(dictoffset > 0);
+            assert(dictoffset % SIZEOF_VOID_P == 0);
+        }
+        return (PyObject**)((char*)obj + dictoffset);
+    } else {
+        fatalOrError(PyExc_NotImplementedError, "unimplemented for hcattrs");
+        return nullptr;
+    }
 }
 
 /* These methods are used to control infinite recursion in repr, str, print,

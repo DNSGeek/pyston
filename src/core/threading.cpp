@@ -30,6 +30,7 @@
 #include "core/thread_utils.h"
 #include "core/util.h"
 #include "runtime/objmodel.h" // _printStacktrace
+#include "runtime/types.h"
 
 namespace pyston {
 namespace threading {
@@ -38,7 +39,7 @@ std::unordered_set<PerThreadSetBase*> PerThreadSetBase::all_instances;
 
 extern "C" {
 __thread PyThreadState cur_thread_state
-    = { 0, 1, NULL, NULL, NULL, NULL }; // not sure if we need to explicitly request zero-initialization
+    = { NULL, 0, 1, NULL, NULL, NULL, NULL }; // not sure if we need to explicitly request zero-initialization
 }
 
 PthreadFastMutex threading_lock;
@@ -497,8 +498,12 @@ static void* find_stack() {
     return NULL; /* not found =^P */
 }
 
+static long main_thread_id;
+
 void registerMainThread() {
     LOCK_REGION(&threading_lock);
+
+    main_thread_id = pthread_self();
 
     assert(!current_internal_thread_state);
     current_internal_thread_state = new ThreadStateInternal(find_stack(), pthread_self(), &cur_thread_state);
@@ -522,6 +527,10 @@ void finishMainThread() {
     current_internal_thread_state->assertNoGenerators();
 
     // TODO maybe this is the place to wait for non-daemon threads?
+}
+
+bool isMainThread() {
+    return pthread_self() == main_thread_id;
 }
 
 
@@ -728,6 +737,24 @@ extern "C" void* PyThread_get_key_value(int) noexcept {
 extern "C" void PyThread_delete_key_value(int key) noexcept {
     Py_FatalError("unimplemented");
 }
+
+
+extern "C" PyObject *_PyThread_CurrentFrames(void) noexcept {
+    try {
+        LOCK_REGION(&threading_lock);
+        BoxedDict* result = new BoxedDict;
+        for (auto& pair : current_threads) {
+            FrameInfo* frame_info = (FrameInfo*)pair.second->public_thread_state->frame_info;
+            Box* frame = getFrame(frame_info);
+            assert(frame);
+            result->d[boxInt(pair.first)] = frame;
+        }
+        return result;
+   } catch (ExcInfo) {
+        RELEASE_ASSERT(0, "not implemented");
+   }
+}
+
 
 } // namespace threading
 } // namespace pyston

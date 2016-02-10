@@ -179,8 +179,6 @@ void initGlobalFuncs(GlobalState& g) {
 
     g.funcs.allowGLReadPreemption = getFunc((void*)threading::allowGLReadPreemption, "allowGLReadPreemption");
 
-    GET(softspace);
-
     GET(createFunctionFromMetadata);
     GET(getFunctionMetadata);
     GET(createUserClass);
@@ -198,6 +196,9 @@ void initGlobalFuncs(GlobalState& g) {
     GET(createClosure);
     GET(createGenerator);
     GET(createSet);
+    GET(initFrame);
+    GET(deinitFrame);
+    GET(makePendingCalls);
 
     GET(getattr);
     GET(getattr_capi);
@@ -242,7 +243,6 @@ void initGlobalFuncs(GlobalState& g) {
     GET(printHelper);
 
     GET(listAppendInternal);
-    GET(getSysStdout);
 
     GET(exec);
     GET(boxedLocalsSet);

@@ -82,18 +82,17 @@ void setupSysEnd();
 
 BoxedDict* getSysModulesDict();
 BoxedList* getSysPath();
-extern "C" Box* getSysStdout();
 
 extern "C" BoxedTuple* EmptyTuple;
 extern "C" BoxedString* EmptyString;
 
 extern "C" {
 extern BoxedClass* object_cls, *type_cls, *bool_cls, *int_cls, *long_cls, *float_cls, *str_cls, *function_cls,
-    *none_cls, *instancemethod_cls, *list_cls, *slice_cls, *module_cls, *dict_cls, *tuple_cls, *file_cls,
-    *enumerate_cls, *xrange_cls, *member_descriptor_cls, *null_importer_cls, *method_cls, *closure_cls, *generator_cls,
-    *complex_cls, *basestring_cls, *property_cls, *staticmethod_cls, *classmethod_cls, *attrwrapper_cls,
-    *pyston_getset_cls, *capi_getset_cls, *builtin_function_or_method_cls, *set_cls, *frozenset_cls, *code_cls,
-    *frame_cls, *capifunc_cls, *wrapperdescr_cls, *wrapperobject_cls;
+    *none_cls, *instancemethod_cls, *list_cls, *slice_cls, *module_cls, *dict_cls, *tuple_cls, *enumerate_cls,
+    *xrange_cls, *member_descriptor_cls, *null_importer_cls, *method_cls, *closure_cls, *generator_cls, *complex_cls,
+    *basestring_cls, *property_cls, *staticmethod_cls, *classmethod_cls, *attrwrapper_cls, *pyston_getset_cls,
+    *capi_getset_cls, *builtin_function_or_method_cls, *set_cls, *frozenset_cls, *code_cls, *frame_cls, *capifunc_cls,
+    *wrapperdescr_cls, *wrapperobject_cls;
 }
 #define unicode_cls (&PyUnicode_Type)
 #define memoryview_cls (&PyMemoryView_Type)
@@ -170,6 +169,7 @@ extern "C" Box* createDict();
 extern "C" Box* createList();
 extern "C" Box* createSlice(Box* start, Box* stop, Box* step);
 extern "C" Box* createTuple(int64_t nelts, Box** elts);
+extern "C" void makePendingCalls();
 
 Box* objectStr(Box*);
 Box* objectRepr(Box*);
@@ -291,10 +291,11 @@ public:
 
     // These should only be used for builtin types:
     static BoxedClass* create(BoxedClass* metatype, BoxedClass* base, gcvisit_func gc_visit, int attrs_offset,
-                              int weaklist_offset, int instance_size, bool is_user_defined, const char* name);
+                              int weaklist_offset, int instance_size, bool is_user_defined, const char* name,
+                              bool is_subclassable = true);
 
     BoxedClass(BoxedClass* base, gcvisit_func gc_visit, int attrs_offset, int weaklist_offset, int instance_size,
-               bool is_user_defined, const char* name);
+               bool is_user_defined, const char* name, bool is_subclassable = true);
 
 
     DEFAULT_CLASS_VAR(type_cls, sizeof(SlotOffset));
@@ -1040,6 +1041,7 @@ public:
 
     struct Context* context, *returnContext;
     void* stack_begin;
+    FrameInfo* top_caller_frame_info;
 
 #if STAT_TIMERS
     StatTimer* prev_stack;
@@ -1145,7 +1147,11 @@ Box* codeForFunction(BoxedFunction*);
 Box* codeForFunctionMetadata(FunctionMetadata*);
 FunctionMetadata* metadataFromCode(Box* code);
 
+Box* getFrame(FrameInfo* frame_info);
 Box* getFrame(int depth);
+void frameInvalidateBack(BoxedFrame* frame);
+extern "C" void deinitFrame(FrameInfo* frame_info);
+extern "C" void initFrame(FrameInfo* frame_info);
 
 inline BoxedString* boxString(llvm::StringRef s) {
     if (s.size() <= 1) {
@@ -1156,11 +1162,15 @@ inline BoxedString* boxString(llvm::StringRef s) {
     return new (s.size()) BoxedString(s);
 }
 
-#define NUM_INTERNED_INTS 100
+#define MIN_INTERNED_INT -5  // inclusive
+#define MAX_INTERNED_INT 256 // inclusive
+static_assert(MIN_INTERNED_INT < 0 && MAX_INTERNED_INT > 0, "");
+#define NUM_INTERNED_INTS ((-MIN_INTERNED_INT) + MAX_INTERNED_INT + 1)
+
 extern BoxedInt* interned_ints[NUM_INTERNED_INTS];
 extern "C" inline Box* boxInt(int64_t n) {
-    if (0 <= n && n < NUM_INTERNED_INTS) {
-        return interned_ints[n];
+    if (n >= MIN_INTERNED_INT && n <= MAX_INTERNED_INT) {
+        return interned_ints[(-MIN_INTERNED_INT) + n];
     }
     return new BoxedInt(n);
 }
@@ -1175,6 +1185,8 @@ inline Box*& getArg(int idx, Box*& arg1, Box*& arg2, Box*& arg3, Box** args) {
         return arg3;
     return args[idx - 3];
 }
+
+extern "C" volatile int _pendingcalls_to_do;
 }
 
 #endif

@@ -34,7 +34,7 @@ struct GlobalFuncs {
 
     llvm::Value* boxInt, *unboxInt, *boxFloat, *unboxFloat, *createFunctionFromMetadata, *getFunctionMetadata,
         *boxInstanceMethod, *boxBool, *unboxBool, *createTuple, *createDict, *createList, *createSlice,
-        *createUserClass, *createClosure, *createGenerator, *createSet;
+        *createUserClass, *createClosure, *createGenerator, *createSet, *initFrame, *deinitFrame, *makePendingCalls;
     llvm::Value* getattr, *getattr_capi, *setattr, *delattr, *delitem, *delGlobal, *nonzero, *binop, *compare,
         *augbinop, *unboxedLen, *getitem, *getitem_capi, *getclsattr, *getGlobal, *setitem, *unaryop, *import,
         *importFrom, *importStar, *repr, *exceptionMatches, *yield, *getiterHelper, *hasnext, *setGlobal, *apply_slice;
@@ -42,7 +42,7 @@ struct GlobalFuncs {
     llvm::Value* unpackIntoArray, *raiseAttributeError, *raiseAttributeErrorStr, *raiseAttributeErrorCapi,
         *raiseAttributeErrorStrCapi, *raiseNotIterableError, *raiseIndexErrorStr, *raiseIndexErrorStrCapi,
         *assertNameDefined, *assertFail, *assertFailDerefNameDefined, *printExprHelper, *printHelper;
-    llvm::Value* listAppendInternal, *getSysStdout;
+    llvm::Value* listAppendInternal;
     ExceptionSwitchable<llvm::Value*> runtimeCall0, runtimeCall1, runtimeCall2, runtimeCall3, runtimeCall, runtimeCallN;
     ExceptionSwitchable<llvm::Value*> callattr0, callattr1, callattr2, callattr3, callattr, callattrN;
     llvm::Value* reoptCompiledFunc, *compilePartialFunc;
